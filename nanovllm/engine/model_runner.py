@@ -7,9 +7,22 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+MODEL_REGISTRY = {
+    "qwen3": Qwen3ForCausalLM,
+    "qwen3_moe": Qwen3MoeForCausalLM,
+}
+
+
+def get_model(hf_config):
+    model_type = getattr(hf_config, "model_type", "qwen3")
+    if model_type not in MODEL_REGISTRY:
+        raise NotImplementedError(f"unsupported model_type: {model_type}")
+    return MODEL_REGISTRY[model_type](hf_config)
 
 
 class ModelRunner:
@@ -19,6 +32,10 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        if getattr(hf_config, "model_type", None) == "qwen3_moe" and not self.enforce_eager:
+            # MoE routing is data-dependent; CUDA graph capture would replay a
+            # stale top-k decision, so force eager until a fused MoE kernel lands.
+            self.enforce_eager = True
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -26,9 +43,10 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        dtype_attr = getattr(hf_config, "torch_dtype", None) or getattr(hf_config, "dtype", None) or "float32"
+        torch.set_default_dtype(getattr(torch, dtype_attr) if isinstance(dtype_attr, str) else dtype_attr)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = get_model(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -109,7 +127,7 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch.get_default_dtype().itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
