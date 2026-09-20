@@ -107,6 +107,22 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def extend_for_tokens(self, seq: Sequence, num_new_tokens: int):
+        target_tokens = seq.num_tokens + num_new_tokens
+        target_blocks = (target_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < target_blocks:
+            seq.block_table.append(self._allocate_block())
+
+    def truncate(self, seq: Sequence, new_num_tokens: int):
+        new_num_blocks = (new_num_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > new_num_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        seq.num_cached_tokens = new_num_tokens
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
