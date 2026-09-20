@@ -237,6 +237,62 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def prepare_verify(self, seqs: list[Sequence], drafts: list[list[int]]):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        for seq, draft in zip(seqs, drafts):
+            K = len(draft)
+            L = seq.num_tokens
+            start = L - 1                # position of the last committed token
+            seqlen_q = K + 1             # feed [last_token] + K draft tokens
+            seqlen_k = L + K             # committed KV + newly written
+            input_ids.extend([seq.last_token] + draft)
+            positions.extend(range(start, start + seqlen_q))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            start_block = start // self.block_size
+            end_block = (start + seqlen_q + self.block_size - 1) // self.block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * self.block_size
+                if i == start_block:
+                    slot_start += start % self.block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * self.block_size + self.block_size
+                else:
+                    slot_end = seq.block_table[i] * self.block_size + (start + seqlen_q) - i * self.block_size
+                slot_mapping.extend(range(slot_start, slot_end))
+        block_tables = self.prepare_block_tables(seqs)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        return input_ids, positions
+
+    @torch.inference_mode()
+    def run_speculative(self, seqs: list[Sequence], drafts: list[list[int]]):
+        input_ids, positions = self.prepare_verify(seqs, drafts)
+        hidden_states = self.model(input_ids, positions)
+        logits = self.model.lm_head.forward_all(hidden_states)
+        per_seq_logits = None
+        if self.rank == 0:
+            per_seq_logits = []
+            offset = 0
+            for draft in drafts:
+                n = len(draft) + 1
+                per_seq_logits.append(logits[offset:offset + n])
+                offset += n
+        reset_context()
+        return per_seq_logits
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
