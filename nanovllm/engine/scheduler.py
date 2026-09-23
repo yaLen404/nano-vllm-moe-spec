@@ -22,40 +22,13 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_seqs = []
+    def schedule(self) -> tuple[list[Sequence], list[Sequence]]:
+        prefill_seqs: list[Sequence] = []
+        decode_seqs: list[Sequence] = []
         num_batched_tokens = 0
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
-                    break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
-            scheduled_seqs.append(seq)
-
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        # ---- decode first: service existing decoders every step (bounded latency) ----
+        while self.running and len(decode_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -67,10 +40,46 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+                decode_seqs.append(seq)
+        self.running.extendleft(reversed(decode_seqs))
+
+        # ---- chunked prefill: round-robin, every waiting seq gets one chunk ----
+        for _ in range(len(self.waiting)):
+            if num_batched_tokens >= self.max_num_batched_tokens:
+                break
+            if len(prefill_seqs) >= self.max_num_seqs:
+                break
+            seq = self.waiting.popleft()
+
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    self.waiting.appendleft(seq)
+                    break
+                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+            else:
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
+
+            remaining = self.max_num_batched_tokens - num_batched_tokens
+            chunk = min(num_tokens, remaining)
+            if chunk <= 0:
+                self.waiting.append(seq)
+                continue
+
+            if not seq.block_table:
+                self.block_manager.allocate(seq, num_cached_blocks)
+
+            seq.num_scheduled_tokens = chunk
+            num_batched_tokens += chunk
+            prefill_seqs.append(seq)
+
+            if seq.num_cached_tokens + chunk == seq.num_tokens:
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
+            else:
+                self.waiting.append(seq)
+
+        return prefill_seqs, decode_seqs
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -87,6 +96,24 @@ class Scheduler:
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+    def postprocess_speculative(self, seqs: list[Sequence], results: list):
+        for seq, (accepted_tokens, num_accepted_draft) in zip(seqs, results):
+            L = seq.num_tokens
+            # stop early on EOS / max_tokens (mid-sequence truncation)
+            stop = len(accepted_tokens)
+            for idx, t in enumerate(accepted_tokens):
+                if (not seq.ignore_eos and t == self.eos) or seq.num_completion_tokens + idx + 1 >= seq.max_tokens:
+                    stop = idx + 1
+                    break
+            # keep KV only for the draft tokens actually committed
+            self.block_manager.truncate(seq, L + min(stop, num_accepted_draft))
+            seq.num_scheduled_tokens = 0
+            for t in accepted_tokens[:stop]:
+                seq.append_token(t)
+            if (not seq.ignore_eos and seq.last_token == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
