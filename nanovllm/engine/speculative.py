@@ -27,7 +27,14 @@ class NgramDraftHead:
 
 
 def speculative_accept(drafts, logits, temperatures):
-    """GPU-vectorized rejection sampling (Leviathan et al.).
+    """GPU-batched rejection sampling (Leviathan et al.).
+
+    Same contract as before: for each sequence, accept the longest draft prefix
+    that passes the rejection test, then append one bonus/replacement token. The
+    acceptance math is identical; only the execution changed — softmax, the
+    acceptance-prefix cumprod and the bonus/replacement draws now run as a few
+    batched kernels, and the GPU->CPU sync happens twice overall instead of
+    several times per sequence.
 
     Args:
         drafts:       list[list[int]], K_i proposed tokens per sequence.
@@ -36,35 +43,72 @@ def speculative_accept(drafts, logits, temperatures):
         temperatures: list[float] per sequence.
 
     Returns:
-        list of (accepted_tokens, num_accepted_draft):
-          accepted_tokens   tokens to append (a accepted draft + 1 bonus/replacement)
-          num_accepted_draft  a = how many DRAFT tokens were accepted (for KV rollback)
+        list of (accepted_tokens, num_accepted_draft): accepted_tokens are the
+        a accepted draft tokens plus one bonus/replacement token; num_accepted_draft
+        is a (used for KV rollback).
     """
-    results = []
-    for draft, lg, T in zip(drafts, logits, temperatures):
-        K = len(draft)
-        if K == 0:
-            results.append(([], 0))
-            continue
-        lg = lg.float() / T
-        probs = torch.softmax(lg, dim=-1)                       # [K+1, vocab]
-        draft_t = torch.tensor(draft, dtype=torch.long, device=lg.device)
-        p_draft = probs[:-1].gather(1, draft_t.unsqueeze(1)).squeeze(1)  # [K]
-        u = torch.rand(K, device=lg.device)
-        # cumprod gives 1 only for the longest accepted prefix
-        a = int((u < p_draft).float().cumprod(0).sum().item())
+    n = len(drafts)
+    results = [None] * n
+    active = [i for i in range(n) if len(drafts[i]) > 0]
+    for i in range(n):
+        if len(drafts[i]) == 0:
+            results[i] = ([], 0)
+    if not active:
+        return results
 
-        accepted = draft[:a]
-        if a == K:
-            bonus = int(torch.multinomial(probs[K], 1).item())
-            accepted = accepted + [bonus]
-        else:
-            adj = probs[a].clone()
-            d = draft[a]
-            adj[d] = 0.0
-            s = adj.sum()
-            adj = adj / s if s > 0 else probs[a]
-            replacement = int(torch.multinomial(adj, 1).item())
-            accepted = accepted + [replacement]
-        results.append((accepted, a))
+    # one softmax over every sequence's logits, each scaled by its own temperature
+    lg_all = torch.cat([logits[i].float() / temperatures[i] for i in active], dim=0)
+    probs_all = torch.softmax(lg_all, dim=-1)          # [sum(K_i+1), vocab]
+    dev = lg_all.device
+
+    # row offsets inside lg_all (K_i draft rows + 1 final row per sequence) and
+    # element offsets inside the flattened per-draft flag vector (K_i elements).
+    offs, doffs, Ks = [], [], []
+    o = d = 0
+    for i in active:
+        K = len(drafts[i])
+        offs.append(o)
+        doffs.append(d)
+        Ks.append(K)
+        o += K + 1
+        d += K
+
+    draft_tokens = [t for i in active for t in drafts[i]]
+    row_ids = torch.tensor([offs[k] + t for k in range(len(active)) for t in range(Ks[k])],
+                           dtype=torch.long, device=dev)
+    col_ids = torch.tensor(draft_tokens, dtype=torch.long, device=dev)
+    p_draft = probs_all[row_ids, col_ids]              # [sum K]
+
+    u = torch.rand(p_draft.shape, device=dev)
+    flags = (u < p_draft).float()
+
+    # padded 2D cumprod: pad = 0 makes the running product die at the end of each
+    # real segment, so the column-wise sum equals the accepted-prefix length a_i
+    Kmax = max(Ks)
+    acc2d = torch.zeros(len(active), Kmax, device=dev)
+    for k in range(len(active)):
+        acc2d[k, :Ks[k]] = flags[doffs[k]:doffs[k] + Ks[k]]
+    a_list = acc2d.cumprod(dim=1).sum(dim=1).long().tolist()   # one sync for all a_i
+
+    # batched bonus / replacement draws
+    last_rows = torch.tensor([offs[k] + Ks[k] for k in range(len(active))], device=dev)
+    sampled = torch.empty(len(active), dtype=torch.long, device=dev)
+    full = [k for k in range(len(active)) if a_list[k] == Ks[k]]
+    rej = [k for k in range(len(active)) if a_list[k] < Ks[k]]
+    if full:
+        rows = torch.tensor([last_rows[k] for k in full], device=dev)
+        sampled[full] = torch.multinomial(probs_all[rows], 1).squeeze(1)
+    if rej:
+        rows = torch.tensor([offs[k] + a_list[k] for k in rej], device=dev)
+        adj = probs_all[rows].clone()
+        d = torch.tensor([drafts[active[k]][a_list[k]] for k in rej], device=dev)
+        adj[torch.arange(len(rej), device=dev), d] = 0.0
+        s = adj.sum(dim=1, keepdim=True)
+        adj = torch.where(s > 0, adj / s, probs_all[rows])
+        sampled[rej] = torch.multinomial(adj, 1).squeeze(1)
+    sampled_list = sampled.tolist()                      # second (and last) sync
+
+    for k, i in enumerate(active):
+        a = a_list[k]
+        results[i] = (drafts[i][:a] + [sampled_list[k]], a)
     return results
