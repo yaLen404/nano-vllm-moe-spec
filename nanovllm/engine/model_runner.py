@@ -53,6 +53,8 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        if not self.enforce_eager and self.world_size == 1 and config.max_speculative_tokens > 0:
+            self.capture_spec_graph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -73,6 +75,8 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if hasattr(self, "spec_graphs"):
+                del self.spec_graphs, self.spec_graph_pool, self.spec_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -279,6 +283,9 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_speculative(self, seqs: list[Sequence], drafts: list[list[int]]):
+        if (self.world_size == 1 and not self.enforce_eager
+                and hasattr(self, "spec_graphs") and len(seqs) <= self.spec_graph_bs[-1]):
+            return self._run_speculative_graph(seqs, drafts)
         input_ids, positions = self.prepare_verify(seqs, drafts)
         hidden_states = self.model(input_ids, positions)
         logits = self.model.lm_head.forward_all(hidden_states)
@@ -292,6 +299,128 @@ class ModelRunner:
                 offset += n
         reset_context()
         return per_seq_logits
+
+    @torch.inference_mode()
+    def _run_speculative_graph(self, seqs: list[Sequence], drafts: list[list[int]]):
+        # Verify forward via a captured CUDA graph (dense model, TP=1). Every
+        # sequence contributes a fixed `max_k + 1` query tokens: its last
+        # committed token, then up to `max_k` draft tokens padded with dummy
+        # ids when the n-gram draft is short. Padded positions are rolled back
+        # by the scheduler and their logits are discarded, so correctness is
+        # preserved while all tensor shapes stay graph-capturable.
+        max_k = self.config.max_speculative_tokens
+        per_seq = max_k + 1
+        bs = len(seqs)
+        n_tok = bs * per_seq
+        gv = self.spec_graph_vars
+        bs_graph = next(x for x in self.spec_graph_bs if x >= bs)
+        graph = self.spec_graphs[bs_graph]
+        n_slots = bs_graph * per_seq
+        max_num_blocks = gv["block_tables"].size(1)
+
+        id_list = [0] * n_slots
+        pos_list = [0] * n_slots
+        sm_list = [-1] * n_slots
+        bt_list = [[0] + [-1] * (max_num_blocks - 1) for _ in range(bs_graph)]
+        cu_k = gv["cu_seqlens_k"]
+        cu_k[0] = 0
+        for s in range(bs_graph):
+            if s < bs:
+                seq, draft = seqs[s], drafts[s]
+                K = len(draft)
+                L = seq.num_tokens
+                start = L - 1
+                base = s * per_seq
+                for j in range(per_seq):
+                    id_list[base + j] = seq.last_token if j == 0 else (draft[j - 1] if j <= K else 0)
+                    pos_list[base + j] = min(start + j, self.config.max_model_len - 1)
+                sblock = start // self.block_size
+                eblock = (start + per_seq + self.block_size - 1) // self.block_size
+                sm = []
+                for i in range(sblock, eblock):
+                    slot_start = seq.block_table[i] * self.block_size
+                    if i == sblock:
+                        slot_start += start % self.block_size
+                    if i != eblock - 1:
+                        slot_end = seq.block_table[i] * self.block_size + self.block_size
+                    else:
+                        slot_end = seq.block_table[i] * self.block_size + (start + per_seq) - i * self.block_size
+                    sm.extend(range(slot_start, slot_end))
+                sm_list[base:base + per_seq] = sm
+                nb = len(seq.block_table)
+                bt_list[s][:nb] = seq.block_table
+                cu_k[s + 1] = cu_k[s] + (L + max_k)
+            else:
+                cu_k[s + 1] = cu_k[s] + per_seq
+
+        gv["input_ids"][:n_slots].copy_(torch.tensor(id_list, dtype=torch.int64, device=gv["input_ids"].device))
+        gv["positions"][:n_slots].copy_(torch.tensor(pos_list, dtype=torch.int64, device=gv["positions"].device))
+        gv["slot_mapping"][:n_slots].copy_(torch.tensor(sm_list, dtype=torch.int32, device=gv["slot_mapping"].device))
+        gv["block_tables"][:bs_graph].copy_(torch.tensor(bt_list, dtype=torch.int32, device=gv["block_tables"].device))
+
+        set_context(True, gv["cu_seqlens_q"][:bs_graph + 1], cu_k[:bs_graph + 1],
+                    per_seq, self.config.max_model_len,
+                    gv["slot_mapping"][:n_slots], None, gv["block_tables"][:bs_graph])
+        graph.replay()
+        logits = self.model.lm_head.forward_all(gv["outputs"][:n_tok])
+        per_seq_logits = []
+        offset = 0
+        for draft in drafts:
+            n = len(draft) + 1
+            per_seq_logits.append(logits[offset:offset + n])
+            offset += per_seq
+        reset_context()
+        return per_seq_logits
+
+    @torch.inference_mode()
+    def capture_spec_graph(self):
+        # Capture the speculative verify forward (dense model only) for a small
+        # set of batch sizes. Shapes are fixed per bucket: `max_k + 1` query
+        # tokens per sequence and `max_seqlen_k = max_model_len` so flash-attn
+        # sizes its workspace once; only buffer VALUES change per replay.
+        config = self.config
+        hf_config = config.hf_config
+        max_k = config.max_speculative_tokens
+        per_seq = max_k + 1
+        max_bs = min(config.max_num_seqs, 16)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        total = max_bs * per_seq
+        input_ids = torch.zeros(total, dtype=torch.int64)
+        positions = torch.zeros(total, dtype=torch.int64)
+        slot_mapping = torch.zeros(total, dtype=torch.int32)
+        cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(max_bs + 1, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(total, hf_config.hidden_size)
+        self.spec_graph_bs = [1, 2, 4, 8, 16]
+        self.spec_graphs = {}
+        self.spec_graph_pool = None
+        for bs in reversed(self.spec_graph_bs):
+            n_tok = bs * per_seq
+            graph = torch.cuda.CUDAGraph()
+            cu_seqlens_q[:bs + 1] = torch.arange(0, (bs + 1) * per_seq, per_seq, dtype=torch.int32)
+            cu_seqlens_k[:bs + 1] = torch.arange(0, (bs + 1) * config.max_model_len, config.max_model_len, dtype=torch.int32)
+            block_tables[:bs] = torch.arange(max_num_blocks, dtype=torch.int32).repeat(bs, 1)
+            slot_mapping[:n_tok] = torch.arange(n_tok, dtype=torch.int32)
+            set_context(True, cu_seqlens_q[:bs + 1], cu_seqlens_k[:bs + 1], per_seq, config.max_model_len,
+                        slot_mapping[:n_tok], None, block_tables[:bs])
+            outputs[:n_tok] = self.model(input_ids[:n_tok], positions[:n_tok])
+            with torch.cuda.graph(graph, self.spec_graph_pool):
+                outputs[:n_tok] = self.model(input_ids[:n_tok], positions[:n_tok])
+            if self.spec_graph_pool is None:
+                self.spec_graph_pool = graph.pool()
+            self.spec_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+        self.spec_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
 
     @torch.inference_mode()
     def capture_cudagraph(self):
