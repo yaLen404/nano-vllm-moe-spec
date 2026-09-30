@@ -1,0 +1,57 @@
+{
+  "tag": "lt_decode_ref_n8",
+  "engine_tag": "current",
+  "dataset": "/tmp/ds_tiny/d9_moe_decode.jsonl",
+  "n_seqs": 8,
+  "runs": 2,
+  "model": "~/huggingface/Qwen3-MoE-tiny",
+  "tp": 1,
+  "budget": 16384,
+  "no_cuda_graph": false,
+  "spec": false,
+  "spec_k": 8,
+  "temperature": null,
+  "moe_reference": true,
+  "startup_s": 9.287695186998462,
+  "median_wall_s": 4.732731814990984,
+  "wall_spread_s": 0.25273542798822746,
+  "throughput_tok_s": 297.5025957608972,
+  "produced_tokens": 1408.0,
+  "ttft_p50": 0.9121191939921118,
+  "ttft_p99": 0.9121336219832301,
+  "ttft_n": 16,
+  "ttft_by_class": {
+    "decode": {
+      "p50": 0.9121191939921118,
+      "p99": 0.9121336219832301,
+      "n": 16
+    }
+  },
+  "peak_gib": 3.931779384613037,
+  "capacity_tokens": 3705856,
+  "demand_tokens": 1920,
+  "spec_stats": {
+    "batches": 0,
+    "seqs": 0,
+    "K": 0,
+    "a": 0
+  },
+  "draft_stats": {
+    "calls": 0,
+    "sec": 0.0,
+    "proposed": 0
+  },
+  "moe_route_sec": 0.33058356380206533,
+  "moe_hist": [
+    6375,
+    6153,
+    5810,
+    4606
+  ],
+  "moe_calls": 1056,
+  "moe_blocks": 4290,
+  "moe_pad_efficiency": 0.08356643356643356,
+  "moe_slots_per_expert_per_call": 5.431818181818182,
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "torch": "2.4.1+cu121"
+}

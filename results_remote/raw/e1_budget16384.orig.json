@@ -1,0 +1,53 @@
+{
+  "tag": "e1_budget16384",
+  "engine_tag": "orig",
+  "dataset": "/root/nano-vllm/.orig-worktree/bench/datasets/t1_long.jsonl",
+  "n_seqs": 24,
+  "runs": 3,
+  "model": "/root/models/Qwen3-0.6B-ms",
+  "tp": 1,
+  "budget": 16384,
+  "no_cuda_graph": false,
+  "spec": false,
+  "spec_k": 8,
+  "temperature": null,
+  "moe_reference": false,
+  "startup_s": 56.590926030185074,
+  "median_wall_s": 0.5395084298215806,
+  "wall_spread_s": 0.18012137291952968,
+  "throughput_tok_s": 5694.072289131669,
+  "produced_tokens": 3072,
+  "ttft_p50": 0.045293182134628296,
+  "ttft_p99": 0.22005741577595472,
+  "ttft_n": 72,
+  "ttft_by_class": {
+    "long": {
+      "p50": 0.04527414217591286,
+      "p99": 0.19711585994809866,
+      "n": 24
+    },
+    "short": {
+      "p50": 0.04529473232105374,
+      "p99": 0.2200581976212561,
+      "n": 48
+    }
+  },
+  "peak_gib": 74.15478181838989,
+  "capacity_tokens": 679424,
+  "demand_tokens": 21504,
+  "spec_stats": {
+    "batches": 0,
+    "seqs": 0,
+    "K": 0,
+    "a": 0
+  },
+  "draft_stats": {
+    "calls": 0,
+    "sec": 0.0,
+    "proposed": 0
+  },
+  "moe_route_sec": 0.0,
+  "moe_hist": null,
+  "gpu": "NVIDIA RTX 6000D",
+  "torch": "2.8.0+cu128"
+}

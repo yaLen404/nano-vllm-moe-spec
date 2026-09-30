@@ -1,0 +1,62 @@
+{
+  "tag": "e1s_budget16384",
+  "engine_tag": "current",
+  "dataset": "/tmp/ds_b/d2_saturating.jsonl",
+  "n_seqs": 10,
+  "runs": 3,
+  "model": "~/huggingface/Qwen3-0.6B",
+  "tp": 1,
+  "budget": 16384,
+  "no_cuda_graph": false,
+  "spec": false,
+  "spec_k": 8,
+  "temperature": null,
+  "moe_reference": false,
+  "startup_s": 90.17699377599638,
+  "median_wall_s": 11.828802359988913,
+  "wall_spread_s": 0.9214122559933458,
+  "throughput_tok_s": 432.841791094462,
+  "produced_tokens": 5120,
+  "ttft_p50": 0.4901466079754755,
+  "ttft_p99": 1.4316129549988545,
+  "ttft_n": 30,
+  "ttft_by_class": {
+    "long": {
+      "p50": 0.48981496298802085,
+      "p99": 1.3741778440016787,
+      "n": 6
+    },
+    "mid": {
+      "p50": 0.4901466079754755,
+      "p99": 1.3744475319981575,
+      "n": 12
+    },
+    "short": {
+      "p50": 0.49025472899666056,
+      "p99": 1.4316129549988545,
+      "n": 12
+    }
+  },
+  "peak_gib": 3.7172818183898926,
+  "capacity_tokens": 19968,
+  "demand_tokens": 22528,
+  "spec_stats": {
+    "batches": 0,
+    "seqs": 0,
+    "K": 0,
+    "a": 0
+  },
+  "draft_stats": {
+    "calls": 0,
+    "sec": 0.0,
+    "proposed": 0
+  },
+  "moe_route_sec": 0.0,
+  "moe_hist": null,
+  "moe_calls": 0,
+  "moe_blocks": 0,
+  "moe_pad_efficiency": null,
+  "moe_slots_per_expert_per_call": null,
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "torch": "2.4.1+cu121"
+}
