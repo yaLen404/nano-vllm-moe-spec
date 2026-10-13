@@ -193,3 +193,17 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# nano-vllm ablation suite artifacts
+bench/datasets/
+bench/models/
+bench/results/
+results/
+BENCH_RESULTS.md
+
+# local tooling / editor residue
+.reasonix/
+.codex
+*.bak
+
+# runtime-generated helper
+**/raw/worker.py
